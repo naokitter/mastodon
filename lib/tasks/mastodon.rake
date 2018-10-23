@@ -751,17 +751,24 @@ namespace :mastodon do
 
       total        = Account.remote.where(protocol: :activitypub).count
       progress_bar = ProgressBar.create(total: total, format: '%c/%C |%w>%i| %e')
+      domain_thresholds = Hash.new { |hash, key| hash[key] = 0 }
+      dead_servers = []
 
       Account.remote.where(protocol: :activitypub).partitioned.find_each do |account|
         progress_bar.increment
 
-        begin
-          code = Request.new(:head, account.uri).perform(&:code)
-        rescue StandardError
-          # This could happen due to network timeout, DNS timeout, wrong SSL cert, etc,
-          # which should probably not lead to perceiving the account as deleted, so
-          # just skip till next time
-          next
+        unless dead_servers.include?(account.domain)
+          begin
+            code = Request.new(:head, account.uri).perform(&:code)
+          rescue HTTP::ConnectionError
+            domain_thresholds[account.domain] += 1
+
+            if domain_thresholds[account.domain] >= 10
+              dead_servers << account.domain
+            end
+          rescue StandardError
+            next
+          end
         end
 
         if [404, 410].include?(code)
@@ -782,6 +789,16 @@ namespace :mastodon do
               SuspendAccountService.new.call(account)
               account.destroy
             end
+          end
+        end
+      end
+
+      # Remove dead servers
+      unless dead_servers.empty?
+        dead_servers.each do |domain|
+          Account.where(domain: domain).find_each do |account|
+            SuspendAccountService.new.call(account)
+            account.destroy
           end
         end
       end
